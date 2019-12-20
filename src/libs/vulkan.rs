@@ -25,6 +25,13 @@ use vulkano::command_buffer::{
 use vulkano::sync::{
     GpuFuture,
 };
+use std::sync::Arc;
+use vulkano::pipeline::ComputePipeline;
+use vulkano::descriptor::descriptor_set::PersistentDescriptorSet;
+use vulkano::image::{StorageImage, Dimensions};
+use vulkano::format::{Format, ClearValue};
+
+use image::{ImageBuffer, Rgba};
 
 
 pub fn test()
@@ -166,4 +173,181 @@ pub fn test()
     //   which in turn converts it into its own implementation-specific format.
     // Note: In the very far future it may be possible to write shaders in Rust, or in a domain specific language that resembles Rust.
 
+    // compile GLSL and generate several structs and methods
+    // including one named Shader that provides a method named load.
+    mod cs {
+        vulkano_shaders::shader!{
+        ty: "compute",
+        src: "
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer Data {
+    uint data[];
+} buf;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    buf.data[idx] *= 12;
+}
+        "
+        }
+    }
+
+    let shader = cs::Shader::load(device.clone())
+        .unwrap();
+
+    let compute_pipeline = Arc::new(
+        ComputePipeline::new(device.clone(), &shader.main_entry_point(), &())
+                .expect("failed to create compute pipeline.")
+    );
+
+    // Creating a descriptor set
+
+    // device is determined from `compute_pipeline`.
+    let set = Arc::new(
+        PersistentDescriptorSet::start(compute_pipeline.clone(), 0)
+            .add_buffer(data_buffer.clone()).unwrap()
+            .build().unwrap()
+    );
+
+    // Dispatch: create the command buffer that will execute our compute pipeline.
+
+    // spawn 1024 work groups
+    // The last parameter contains the push constants, which are a way to pass a small amount of data to a shader.
+    let command_buffer = AutoCommandBufferBuilder::new(device.clone(), queue_family).unwrap()
+        .dispatch([1024, 1, 1], compute_pipeline.clone(), set.clone(), ()).unwrap()
+        .build().unwrap();
+
+    // submit the command buffer
+    let finished = command_buffer.execute(queue.clone()).unwrap();
+    // wait for it to complete
+    finished.then_signal_fence_and_flush().unwrap()
+        .wait(None).unwrap();
+
+    //check that the pipeline has been correctly executed
+    let content = data_buffer.read().unwrap();
+    for (n, val) in content.iter().enumerate() {
+        assert_eq!(*val, n as u32 * 12);
+    }
+
+    println!("Everything succeeded!");
+
+
+    // Creating an image
+
+    // Properties of an image: in the context of Vulkan images can be one to three dimensional.
+    // The dimensions of an image are chosen when you create it.
+    // There are two kinds of three-dimensional images: actual three-dimensional images, and arrays of two-dimensional layers.
+    // The difference is that with the former the layers are expected to be contiguous, while for the latter you can manage layers individually as if they were separate two-dimensional images.
+
+    let image = StorageImage::new(device.clone(), Dimensions::Dim2d {width:1024, height:1024},
+        Format::R8G8B8A8Unorm, Some(queue.family())).unwrap();
+
+    // Clearing an image:  ask the GPU to fill our image with a specific color.
+
+    // Exporting the content of an image
+
+    // Copying from the image to the buffer
+    // The buffer has to be large enough
+    // Each pixel of the image contains four unsigned 8-bit values, and the image dimensions are 1024 by 1024 pixels.
+    // Hence why the number of elements in the buffer is 1024 * 1024 * 4.
+
+    let buf = CpuAccessibleBuffer::from_iter(device.clone(), BufferUsage::all(),
+                                             (0..1024*1024*4).map(|_| 0u8))
+        .expect("failed to create buffer");
+
+    // Note: The function is called clearing a color image, as opposed to depth and/or stencil images which we haven't covered yet.
+    // The image was created with the R8G8B8A8Unorm format.
+    // The R8G8B8A8 part means that the four components are stored in 8 bits each, while the Unorm suffix means "unsigned normalized".
+    // The coordinates being "normalized" means that their value in memory (ranging between 0 and 255) is interpreted as floating point values.
+    // The in-memory value 0 is interpreted as the floating-point 0.0, and the in-memory value 255 is interpreted as the floating-point 1.0.
+    let command_buffer = AutoCommandBufferBuilder::new(device.clone(), queue.family()).unwrap()
+        .clear_color_image(image.clone(), ClearValue::Float([0.0, 0.0, 1.0, 1.0])).unwrap()
+        .copy_image_to_buffer(image.clone(), buf.clone()).unwrap()
+        .build().unwrap();
+
+
+    let finished = command_buffer.execute(queue.clone()).unwrap();
+    finished.then_signal_fence_and_flush().unwrap()
+        .wait(None).unwrap();
+
+    // Turning the image into a PNG
+    let buffer_content = buf.read().unwrap();
+    let image = ImageBuffer::<Rgba<u8>, _>::from_raw(1024, 1024, &buffer_content[..]).unwrap();
+    image.save("image.png").unwrap();
+
+
+    mod mandelrot_set {
+        // Draw a Mandelbrot set
+        vulkano_shaders::shader!{
+            ty: "compute",
+            src: r#"
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set=0, binding=0, rgba8) uniform writeonly image2D img;
+
+void main() {
+    vec2 norm_coordinates = (gl_GlobalInvocationID.xy + vec2(0.5)) / vec2(imageSize(img));
+    vec2 c = (norm_coordinates - vec2(0.5)) * 2.0 - vec2(1.0, 0.0);
+
+    vec2 z = vec2(0.0, 0.0);
+    float i;
+    for (i=0.0; i<1.0; i+=0.005) {
+        z = vec2(
+            z.x*z.x - z.y*z.y + c.x,
+            z.y*z.x + z.x*z.y + c.y
+        );
+
+        if (length(z)>4.0) {
+            break;
+        }
+    }
+
+    vec4 to_write = vec4(vec3(i), 1.0);
+    imageStore(img, ivec2(gl_GlobalInvocationID.xy), to_write);
+}
+            "#
+        }
+    }
+
+    let shader = mandelrot_set::Shader::load(device.clone())
+        .unwrap();
+
+    let compute_pipeline = Arc::new(
+        ComputePipeline::new(device.clone(), &shader.main_entry_point(), &())
+            .expect("failed to create compute pipeline.")
+    );
+
+    // Calling this shader
+    let image = StorageImage::new(device.clone(), Dimensions::Dim2d {width:1024, height:1024},
+        Format::R8G8B8A8Unorm, Some(queue.family())).unwrap();
+
+    // This time we use the add_image function instead of add_buffer
+    let set = Arc::new(
+       PersistentDescriptorSet::start(compute_pipeline.clone(), 0)
+           .add_image(image.clone()).unwrap()
+           .build().unwrap()
+    );
+
+    // create a buffer where to write the output
+    let buf = CpuAccessibleBuffer::from_iter(device.clone(), BufferUsage::all(),
+                                             (0..1024*1024*4).map(|_| 0u8))
+        .expect("failed to create buffer");
+
+    let command_buffer = AutoCommandBufferBuilder::new(device.clone(), queue.family()).unwrap()
+        .dispatch([1024/8, 1024/8, 1], compute_pipeline.clone(), set.clone(), ()).unwrap()
+        .copy_image_to_buffer(image.clone(), buf.clone()).unwrap()
+        .build().unwrap();
+
+    let finished = command_buffer.execute(queue.clone()).unwrap();
+    finished.then_signal_fence_and_flush().unwrap()
+        .wait(None).unwrap();
+
+    let buffer_content = buf.read().unwrap();
+    let image = ImageBuffer::<Rgba<u8>, _>::from_raw(1024, 1024, &buffer_content[..]).unwrap();
+    image.save("image.png").unwrap();
 }
