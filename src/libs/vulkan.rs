@@ -1,43 +1,75 @@
 #![allow(unused)]
 
-use vulkano::instance::{
-    Instance,
-    InstanceExtensions,
-    PhysicalDevice,
+use vulkano::{
+    descriptor::{
+        descriptor_set::PersistentDescriptorSet,
+    },
+    device::{
+        Device,
+        DeviceExtensions,
+        Features,
+    },
+    buffer::{
+        BufferUsage,
+        CpuAccessibleBuffer,
+    },
+    command_buffer::{
+        CommandBuffer,
+        AutoCommandBufferBuilder,
+        DynamicState,
+    },
+    format::{
+        Format,
+        ClearValue,
+    },
+    framebuffer::{
+        Framebuffer,
+        Subpass,
+    },
+    image::{
+        StorageImage,
+        Dimensions,
+    },
+    instance::{
+        Instance,
+        InstanceExtensions,
+        PhysicalDevice,
+    },
+    pipeline::{
+        ComputePipeline,
+        shader::GraphicsShaderType::Vertex,
+        GraphicsPipeline,
+        viewport::Viewport,
+    },
+    swapchain::{
+        Swapchain,
+        SurfaceTransform,
+        PresentMode,
+    },
+    sync::{
+        GpuFuture,
+    },
 };
 
-use vulkano::device::{
-    Device,
-    DeviceExtensions,
-    Features,
-};
-
-use vulkano::buffer::{
-    BufferUsage,
-    CpuAccessibleBuffer,
-};
-
-use vulkano::command_buffer::{
-    CommandBuffer,
-    AutoCommandBufferBuilder,
-};
-
-use vulkano::sync::{
-    GpuFuture,
-};
 use std::sync::Arc;
-use vulkano::pipeline::ComputePipeline;
-use vulkano::descriptor::descriptor_set::PersistentDescriptorSet;
-use vulkano::image::{StorageImage, Dimensions};
-use vulkano::format::{Format, ClearValue};
 
 use image::{ImageBuffer, Rgba};
+
+use vulkano_win::VkSurfaceBuild;
+
+use winit::{
+    EventsLoop,
+    WindowBuilder,
+};
 
 
 pub fn test()
 {
-    let instance = Instance::new(None, &InstanceExtensions::none(), None)
-        .expect("failed to create instance.");
+    let instance = {
+        let extensions = vulkano_win::required_extensions();
+        Instance::new(None, &extensions, None)
+            .expect("failed to create instance.")
+    };
 
     let physical = PhysicalDevice::enumerate(&instance)
         .next()
@@ -54,8 +86,12 @@ pub fn test()
 
     // Creating a device returns two things: the device itself, a list of queue objects(an iterator)
     let (device, mut queues) = {
+        let device_ext = DeviceExtensions{
+            khr_swapchain: true,
+            ..DeviceExtensions::none()
+        };
         Device::new(
-            physical, &Features::none(), &DeviceExtensions::none(),
+            physical, &Features::none(), &device_ext,
             [(queue_family, 0.5)].iter().cloned()
         )
             .expect("failed to create device.")
@@ -276,7 +312,7 @@ void main() {
     // Turning the image into a PNG
     let buffer_content = buf.read().unwrap();
     let image = ImageBuffer::<Rgba<u8>, _>::from_raw(1024, 1024, &buffer_content[..]).unwrap();
-    image.save("image.png").unwrap();
+    image.save("image1.png").unwrap();
 
 
     mod mandelrot_set {
@@ -348,6 +384,192 @@ void main() {
         .wait(None).unwrap();
 
     let buffer_content = buf.read().unwrap();
+    let image_buffer = ImageBuffer::<Rgba<u8>, _>::from_raw(1024, 1024, &buffer_content[..]).unwrap();
+    image_buffer.save("image2.png").unwrap();
+
+    // Graphics pipeline introduction: Using the graphics pipeline is more restrictive than using compute operations, but it is also much faster
+
+    // start by executing a `vertex shader` (that is part of the graphics pipeline object)
+    // then executes a `fragment shader` (also part of the graphics pipeline object)
+
+    // Vertex buffer
+    #[derive(Default, Copy, Clone)]
+    struct Vertex {
+        position: [f32; 2],
+    }
+
+    vulkano::impl_vertex!(Vertex, position);
+
+    let vertex1 = Vertex{position: [-0.5, -0.5]};
+    let vertex2 = Vertex{position: [0.0, 0.5]};
+    let vertex3 = Vertex{position: [0.5, -0.25]};
+
+    let vertex_buffer = CpuAccessibleBuffer::from_iter(device.clone(), BufferUsage::all(),
+        vec![vertex1, vertex2, vertex3].into_iter()).unwrap();
+
+    // Vertex shader: GPU pick each element from this buffer
+
+    // Note: Calling the impl_vertex! macro is what makes it possible for vulkano to build the link between the content of the buffer and the input of the vertex shader.
+    // The line layout(location = 0) in vec2 position; declares that each vertex has an attribute named position and of type vec2.
+    // This corresponds to the definition of the Vertex struct we created.
+    // The main function is called once for each vertex
+    // gl_Position is a special "magic" global variable that exists only in the context of a vertex shader and whose value must be set to the position of the vertex on the surface.
+    // This is how the GPU knows how to position our shape.
+    mod vertex_shader {
+        vulkano_shaders::shader!{
+            ty: "vertex",
+            src: r#"
+                #version 450
+
+                layout(location = 0) in vec2 position;
+
+                void main() {
+                    gl_Position = vec4(position, 0.0, 1.0);
+                }
+            "#
+        }
+    }
+
+    let vertex_shader = vertex_shader::Shader::load(device.clone())
+        .expect("failed to create vertex shader");
+
+    // Fragment shader
+
+    // Only pixels that within the shape of the triangle will be modified on the final image.
+    // The `layout(location = 0) out vec4 f_color;` line declares an output named f_color.
+    mod fragment_shader {
+        vulkano_shaders::shader!{
+            ty: "fragment",
+            src: r#"
+                #version 450
+
+                layout(location = 0) out vec4 f_color;
+
+                void main() {
+                    f_color = vec4(1.0, 0.0, 0.0, 1.0);
+                }
+            "#
+        }
+    }
+
+    let fragment_shader = fragment_shader::Shader::load(device.clone())
+        .expect("failed to create fragment shader");
+
+    // Render passes: In order to fully optimize and parallelize commands execution, it is only once we have entered a special "rendering mode"  called render pass that you can draw.
+
+    // Creating a render pass: A render pass is made of attachments and passes
+    let render_pass = Arc::new(vulkano::single_pass_renderpass!(device.clone(),
+        attachments: {
+            color: {
+                load: Clear, // we want the GPU to clear the image when entering the render pass (ie. fill it with a single color)
+                store: Store, // we want the GPU to actually store the output of our draw commands to the image
+                format: Format::R8G8B8A8Unorm,
+                samples: 1,
+            }
+        },
+        pass: {
+            color: [color],
+            depth_stencil: {}
+        }
+    ).unwrap());
+
+    // Entering the render pass
+
+    let image = StorageImage::new(device.clone(), Dimensions::Dim2d {width:1024, height:1024},
+        Format::R8G8B8A8Unorm, Some(queue.family())).unwrap();
+    let buf = CpuAccessibleBuffer::from_iter(device.clone(), BufferUsage::all(),
+                                             (0..1024*1024*4).map(|_| 0u8))
+        .expect("failed to create buffer");
+
+    // creating a framebuffer to indicate the actual list of attachments
+    let framebuffer = Arc::new(Framebuffer::start(render_pass.clone())
+        .add(image.clone()).unwrap()
+        .build().unwrap()
+    );
+    // ready the enter drawing mode!
+    AutoCommandBufferBuilder::primary_one_time_submit(device.clone(), queue.family()).unwrap()
+        .begin_render_pass(framebuffer.clone(), false, vec![[0.0, 0.0, 1.0, 1.0].into()]).unwrap()
+        .end_render_pass().unwrap();
+
+    let pipeline = Arc::new(GraphicsPipeline::start()
+        // Defines what kind of vertex input is expected.
+        .vertex_input_single_buffer::<Vertex>()
+        // The vertex shader.
+        .vertex_shader(vertex_shader.main_entry_point(), ())
+        // Defines the viewport (explanations below).
+        // If the viewport state wasn't dynamic, then we would have to create a new pipeline object if we wanted to draw to another image of a different size.
+        // Note: If you configure multiple viewports, you can use geometry shaders to choose which viewport the shape is going to be drawn to.
+        .viewports_dynamic_scissors_irrelevant(1)
+        // The fragment shader.
+        .fragment_shader(fragment_shader.main_entry_point(), ())
+        // This graphics pipeline object concerns the first pass of the render pass.
+        .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
+
+        .build(device.clone()).unwrap()
+    );
+
+    // Drawing
+    let dynamic_state = DynamicState{
+        viewports: Some(vec![Viewport{
+            origin: [0.0, 0.0],
+            dimensions: [1024.0, 1024.0],
+            depth_range: 0.0..1.0,
+        }]),
+        ..DynamicState::none()
+    };
+
+    let command_buffer = AutoCommandBufferBuilder::primary_one_time_submit(device.clone(), queue.family()).unwrap()
+        .begin_render_pass(framebuffer.clone(), false, vec![[0.0, 0.0, 1.0, 1.0].into()]).unwrap()
+        .draw(pipeline.clone(), &dynamic_state, vertex_buffer.clone(), (), ()).unwrap()
+        .end_render_pass().unwrap()
+
+        .copy_image_to_buffer(image.clone(), buf.clone()).unwrap()
+        .build().unwrap()
+    ;
+
+    let finished = command_buffer.execute(queue.clone()).unwrap();
+    finished.then_signal_fence_and_flush().unwrap()
+        .wait(None).unwrap();
+
+    let buffer_content = buf.read().unwrap();
     let image = ImageBuffer::<Rgba<u8>, _>::from_raw(1024, 1024, &buffer_content[..]).unwrap();
-    image.save("image.png").unwrap();
+    image.save("triangle.png").unwrap();
+
+
+    // Windowing: draw graphics on it,
+    let mut events_loop = EventsLoop::new();
+    let surface = WindowBuilder::new().build_vk_surface(&events_loop, instance.clone()).unwrap();
+
+    // Events handling
+    events_loop.run_forever(|evt|{
+        match evt {
+            winit::WindowEvent{event: winit::WindowEvent::CloseRequested, ..} => {
+                winit::ControlFlow::Break
+            },
+            _ => winit::ControlFlow::Continue,
+        }
+    });
+
+    // Swapchains
+
+    // Creating a swapchain
+    // first query the capabilities of the surface
+    let caps = surface.capabilities(physical)
+        .expect("failed to get surface capabilities");
+
+    // choose the dimensions of the image (minimum and a maximum)
+    let dimensions = caps.current_extent().unwrap_or([1280, 1024]);
+    // the behavior when it comes to transparency
+    let alpha = caps.supported_composite_alpha.iter().next().unwrap();
+    // the format of the images
+    let format = caps.supported_formats[0].0;
+
+    //create the swapchain
+    let (swapchain, images) = Swapchain::new(device.clone(), surface.clone(),
+        caps.min_image_count, format, dimensions, 1, caps.supported_usage_flags, &queue,
+        SurfaceTransform::Identity, alpha, PresentMode::Fifo, true, None)
+        .expect("failed to create swapchain");
+
+    // Usage of a swapchain
+    let (image_num, acquire_future) = swapchain::acquire_next_image(swapchain.clone()).unwrap();
 }
